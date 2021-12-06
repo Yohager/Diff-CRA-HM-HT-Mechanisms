@@ -74,6 +74,30 @@ def CreateSpecificRP():
         providers[idx] = tmp 
     return requester, providers
 
+def _FixCompetitors(graph, target):
+    '''
+    graph: nx结构的图
+    target: 节点的idx属性即可
+    '''
+    g = copy.deepcopy(graph)
+    # 返回值为所有的competitors的idx的集合
+    res = set()
+    all_nodes = set(g.nodes)
+    g.remove_node(target)
+    if not nx.is_connected(g):
+        # 出现不连通的情况则表示当前这个节点存在支配的节点
+        left_nodes = nx.node_connected_component(g, 0)
+        # for node in all_nodes:
+        #     if node not in left_nodes:
+        #         res.add(node)
+        for node in left_nodes:
+            res.add(node)
+        res = res - {0}
+    else:
+        res = all_nodes - {0, target}
+    del g
+    return res
+
 
 def _graph_to_cr_tree(network):
     """
@@ -124,6 +148,23 @@ def _graph_to_cr_tree(network):
     print("Graph to critical referrer tree process consumes: ", time.time() - start)
     return cr_tree.to_undirected()
 
+
+def _CalculateLeftTasks(cur_winners,tasks,profile):
+    finished_tasks = set()
+    #print('calculateleft tasks:',cur_winners)
+    for w in cur_winners:
+        for t in profile[w].tasks:
+            finished_tasks.add(t)
+    # tasks以字典的形式传入，传入的key表示为task的idx，value等于task的保留价格
+    all_tasks = set(list(tasks.keys()))
+
+    left_keys = all_tasks - finished_tasks
+    left_d = {}
+    for k in left_keys:
+        left_d[k] = tasks[k]
+    return left_d
+
+
 def marginal_value(winners,tasks_price,profile,target):
     '''
     para: winners 当前的winners，传入的参数应该是一个数组，其中每个元素是一个provider的类实例
@@ -158,6 +199,36 @@ def maximize_marginal_value(winners,tasks_prices,profile):
     # print('here the marginal valuation is:',mv_0)
     return mv_0[0] if len(mv_0) > 0 else [-1,-1] 
 
+def mv(tasks,target,profile):
+    mv = 0
+    for t in tasks:
+        if t in profile[target].tasks:
+            mv += tasks[t]
+    return mv 
+
+def _OPTChooseFunction(p,competitors, profile, cur_winners,tasks):
+    '''
+    接受以下几个参数：当前参与竞争的对象，当前这群竞争者的profile以及当前的winners
+    profile接受一个全部参与者的profile
+    '''
+    res = cur_winners
+    cur_tasks = _CalculateLeftTasks(res,tasks,profile)
+    # print('current_p:',p,'current_tasks:',cur_tasks)
+    # competitors_profile = {k:v for k,v in profile.items() if k in competitors}
+    while True:
+        if competitors == set():
+            break 
+        mvs = [[target,mv(cur_tasks,target,profile)-profile[target].cost] for target in competitors]
+        mvs.sort(key=lambda x:-x[1])
+        print('here mvs:',mvs)
+        if mvs[0][1] <= 0: #不存在边际价值大于0的参与者
+            break 
+        res.add(mvs[0][0])
+        cur_tasks = _CalculateLeftTasks(res,tasks,profile)
+        competitors.remove(mvs[0][0])
+    print('opt choose functions:',res)
+    return True if p in res else False 
+        
 
 class RequesterHT:
     def __init__(self, price):
@@ -304,6 +375,7 @@ class DiffusionCrowdsensingMechanismHT:
         self.payments = {}
         self.cr_tree = None
         self.graph = graph
+        self.left_tasks = self.tasks
 
     def _ConstructDiffusionTree(self):
         self.cr_tree = _graph_to_cr_tree(self.graph)
@@ -312,25 +384,108 @@ class DiffusionCrowdsensingMechanismHT:
         for provider in self.providers:
             self.providers[provider].distance = nx.shortest_path_length(self.graph, 0, self.providers[provider].idx)
     
+    def _CalculateLeftTasks(self,cur_winners,tasks,profile):
+        finished_tasks = set()
+        for w in cur_winners:
+            for t in profile[w].tasks:
+                finished_tasks.add(t)
+        # tasks以字典的形式传入，传入的key表示为task的idx，value等于task的保留价格
+        all_tasks = set(list(tasks.keys()))
+        left_keys = all_tasks - finished_tasks
+        left_d = dict()
+        for k in left_keys:
+            left_d[k] = tasks[k]
+        return left_d
+    
+    def _mv(self,idx,tasks,profile):
+        mv = 0
+        for t in tasks:
+            if t in profile[idx].tasks:
+                mv += tasks[t]
+        return mv 
+    
     def AllocationAndPayment(self):
-        self._CalculateDistance()
-        self._ConstructDiffusionTree()  
+        self._CalculateDistance() #计算所有节点到requester的distance
+        self._ConstructDiffusionTree() #构建diffusion tree
         distances = [[self.providers[p].idx,self.providers[p].distance] for p in self.providers]
-        distances.sort(key=lambda x:x[1])
+        distances.sort(key=lambda x:x[1]) # 将每一个provider的id和到requester的distance作为二元组传入并进行排序，决定被判别的顺序
         print(distances)
-        cur_winners = []
-        #profile = self.providers
+        cur_winners = set()
+        profile = self.providers
+        cur_tasks = self.vals
         for p in distances:
-            cur_p = self.providers[p[0]]
+            # cur_p = self.providers[p[0]]
             # 首先判断其边际价值是否大于0 
-            cur_mv = marginal_value(cur_winners,self.requester.reserved_price,self.providers,cur_p)
+            # cur_mv = marginal_value(cur_winners,self.requester.reserved_price,self.providers,cur_p)
+            print('current provider is:',p[0])
+            cur_tasks = self._CalculateLeftTasks(cur_winners,cur_tasks,profile)
+            cur_mv = self._mv(p[0],cur_tasks,profile)
             if cur_mv < 0:
                 continue 
             # 先明确他的竞争对手 N \ C_i \W 
-            cur_children = []
-            cur_p_competitors = [self.providers[k] for k in self.providers if k not in cur_winners and k not in ]
-            
+            # 首先调用fixcompetitors函数来确定需要竞争的人数，然后再将那部分cur_winners去掉
+            cur_competitors = _FixCompetitors(self.cr_tree,p[0]) # 返回的值是一个set类型
+            cur_market = cur_competitors - cur_winners
+            cur_market.add(p[0])
+            # print('current market: ',cur_market,p)
+            if _OPTChooseFunction(p[0],cur_market,self.providers,cur_winners,self.vals):
+                # 如果当前这个p[0]能够成为一个winner，将其添加到winner set中
+                
+                cur_winners.add(p[0])
+                cur_tasks = self._CalculateLeftTasks(cur_winners,cur_tasks,profile)
+        for x in cur_winners:
+            self.winners[x] = 1 
+        print(self.winners)
+        # 下面处理每一个winner的payment
+        # after calcalating the final winners, we decides the tasks cannot be finished by those selected providers.
+        self.left_tasks = self._CalculateLeftTasks(set(list(self.winners.keys())),self.vals,profile)
+        print('final left tasks:',self.left_tasks)
+        '''
+        for each winner, her payment equals the critical report value to become one winner 
+        '''
+        for w in self.winners:
+            payment_w = 0
+            idxs_without_w = _FixCompetitors(self.cr_tree,w)
+            new_winners = set() 
+            tasks_without_w = self._CalculateLeftTasks(new_winners,self.vals,profile)
+            while True:
+                if idxs_without_w == set():
+                    break 
+                mvs = [[i,self._mv(i,tasks_without_w,profile)-profile[i].cost] for i in idxs_without_w]
+                print(mvs)
+                mvs.sort(key=lambda x:-x[1])
+                if mvs[0][1] <= 0:
+                    break 
+                tmp_val = self._mv(w,tasks_without_w,profile) - mvs[0][1]
+                payment_w = max(payment_w,min(tmp_val,self._mv(w,tasks_without_w,profile)))
+                new_winners.add(mvs[0][0])
+                idxs_without_w.remove(mvs[0][0])
+                tasks_without_w = self._CalculateLeftTasks(new_winners,self.vals,profile)
+            if idxs_without_w == set():
+                payment_w = max(payment_w,self._mv(w,tasks_without_w,profile))
+            print('new_winners:',new_winners)
+            self.payments[w] = payment_w
+        print('payments for winners:',self.payments)
+    def AllocationResults(self):
+        return self.winners
+    
+    def PaymentResults(self):
+        return self.payments
 
+    def TotalSocialCost(self):
+        sc = 0
+        for winner in self.winners:
+            sc += self.providers[winner].cost 
+        
+        for lt in self.left_tasks:
+            sc += self.requester.reserved_p[lt]
+        return sc 
+
+    def TotalPayment(self):
+        t_pay = sum(self.payments.values())
+        for lt in self.left_tasks:
+            t_pay += self.requester.reserved_p[lt]
+        return t_pay
 
 
 
@@ -344,3 +499,4 @@ if __name__ == "__main__":
     # tmp_ndm.AllocationAndPayment()
     tmp_dcm_ht = DiffusionCrowdsensingMechanismHT(requester,providers,basic_g)
     tmp_dcm_ht.AllocationAndPayment()
+    print('the total payment is:',tmp_dcm_ht.TotalPayment())
